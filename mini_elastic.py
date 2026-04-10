@@ -10,6 +10,7 @@ import os
 import re
 import time
 import uuid
+import pickle
 from collections import defaultdict
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -17,58 +18,74 @@ from typing import Any
 
 # For HNSW Vector Search
 import numpy as np
+
+# Safely handle the hnsw-lite import based on official PyPI documentation
 try:
-    import hnswlite
+    from hnsw.hnsw import HNSW
+    from hnsw.node import Node
     HNSW_AVAILABLE = True
 except ImportError:
     HNSW_AVAILABLE = False
-    print("⚠️ hnswlite not found! Run 'pip install hnswlite' to enable fast Vector Search.")
+    print("⚠️ hnsw-lite not found! Run 'pip install hnsw-lite' to enable fast Vector Search.")
 
 # ─────────────────────────────────────────────
 #  HNSW Lite Adaptive Wrapper
 # ─────────────────────────────────────────────
 class HNSWLiteWrapper:
     """
-    Safely wraps the hnswlite PyPI package. Uses duck-typing to support
-    varying API signatures (e.g. add vs add_items) depending on the package version.
+    Safely wraps the hnsw-lite PyPI package based on its official API.
+    Handles the Node object requirements and negated distances automatically.
     """
     def __init__(self, dim: int):
-        try:
-            self.index = hnswlite.Index(dim=dim)
-        except TypeError:
-            # Fallback if the library requires explicit metric/space
-            self.index = hnswlite.Index(space='cosine', dim=dim)
+        # The hnsw-lite package doesn't strictly need dim at init, but we keep the signature
+        if HNSW_AVAILABLE:
+            self.index = HNSW(space="cosine", M=16, ef_construction=200)
+        else:
+            self.index = None
 
     def add_items(self, vectors: np.ndarray, ids: np.ndarray):
-        if hasattr(self.index, 'add_items'):
-            self.index.add_items(vectors, ids)
-        elif hasattr(self.index, 'add'):
-            self.index.add(vectors, ids)
-        else:
-            raise AttributeError("hnswlite Index has no known add method.")
+        if not self.index: return
+        for v, idx in zip(vectors, ids):
+            # hnsw-lite expects native Python lists
+            vec_list = [float(x) for x in v]
+            # We store the internal hnsw_id directly inside the node's metadata
+            self.index.insert(vec_list, {"id": int(idx)})
 
     def knn_query(self, query_vector: np.ndarray, k: int):
-        if hasattr(self.index, 'knn_query'):
-            return self.index.knn_query(query_vector, k=k)
-        elif hasattr(self.index, 'search'):
-            return self.index.search(query_vector, k=k)
+        if not self.index: 
+            return np.array([]), np.array([])
+            
+        # Extract the 1D list from the numpy array
+        if query_vector.ndim == 2:
+            vec_list = [float(x) for x in query_vector[0]]
         else:
-            raise AttributeError("hnswlite Index has no known search method.")
+            vec_list = [float(x) for x in query_vector]
+            
+        # hnsw-lite requires wrapping queries in a Node object (level 0)
+        query_node = Node(vec_list, 0)
+        
+        # Returns list of tuples: (negated_distance, Node)
+        results = self.index.knn_search(query_node, k)
+        
+        labels = []
+        distances = []
+        
+        for dist, node in results:
+            labels.append(node.metadata["id"])
+            # The documentation explicitly states: "Distances are negated in results"
+            actual_distance = -dist
+            distances.append(actual_distance)
+            
+        return np.array([labels]), np.array([distances])
 
     def save_index(self, filepath: str):
-        if hasattr(self.index, 'save_index'):
-            self.index.save_index(filepath)
-        elif hasattr(self.index, 'save'):
-            self.index.save(filepath)
+        # Pure Python fallback for saving the class object
+        with open(filepath, 'wb') as f:
+            pickle.dump(self.index, f)
 
     def load_index(self, filepath: str, max_elements: int):
-        if hasattr(self.index, 'load_index'):
-            try:
-                self.index.load_index(filepath, max_elements=max_elements)
-            except TypeError:
-                self.index.load_index(filepath)
-        elif hasattr(self.index, 'load'):
-            self.index.load(filepath)
+        with open(filepath, 'rb') as f:
+            self.index = pickle.load(f)
 
 # ─────────────────────────────────────────────
 #  Tokenizer & Text utilities
@@ -321,18 +338,12 @@ class Index:
         if doc_id not in self.docs:
             raise KeyError(f"Document '{doc_id}' not found.")
             
-        # HNSW doesn't reliably support pure deletion in all lite versions without rebuilding,
-        # but we remove it from mapping so it won't be returned in Hybrid Search.
+        # Soft delete handling for lite libraries (de-links it from mapping)
         if HNSW_AVAILABLE:
             for field, wrapper in self.hnsw_indices.items():
                 mapping = self.hnsw_mappings[field]
                 if doc_id in mapping["doc_to_hnsw"]:
-                    # Attempt soft delete if available in the specific hnswlite version
                     hnsw_id = mapping["doc_to_hnsw"][doc_id]
-                    if hasattr(wrapper.index, 'mark_deleted'):
-                        try: wrapper.index.mark_deleted(hnsw_id)
-                        except: pass
-                    # Remove from mapping route
                     del mapping["doc_to_hnsw"][doc_id]
                     if str(hnsw_id) in mapping["hnsw_to_doc"]:
                         del mapping["hnsw_to_doc"][str(hnsw_id)]
@@ -461,7 +472,6 @@ class Index:
         qtype = list(query.keys())[0] if query else "match_all"
         is_match_all = (qtype == "match_all")
         
-        # Avoid running a default match_all if user strictly wanted KNN
         if not (knn and is_match_all):
             lex_scores = self._lexical_search(query)
 
@@ -485,10 +495,11 @@ class Index:
                         for label, dist in zip(labels[0], distances[0]):
                             doc_id = mapping["hnsw_to_doc"].get(str(label))
                             if doc_id:
-                                knn_scores[doc_id] = 1.0 - float(dist)
+                                # For cosine space, distance returned is usually 1 - cosine_sim
+                                # Our distances from HNSW-lite were negated as actual positive distances
+                                knn_scores[doc_id] = max(0, 1.0 - float(dist))
                     except Exception as e:
-                        # Silently pass if index isn't ready
-                        pass
+                        pass # Index not ready or unsupported dimension
 
         # 3. Reciprocal Rank Fusion (RRF) Hybrid Scoring
         scores = {}
@@ -538,7 +549,7 @@ class Index:
                 "_source": source,
             }
             
-            # Explicitly expose indexes and sub-scores for analysis if doing Hybrid Search
+            # Expose scores for analysis
             if lex_scores and knn_scores:
                 hit_payload["_rrf_score"] = hit_payload["_score"]
                 hit_payload["_vector_score"] = round(knn_scores.get(doc_id, 0), 4)
@@ -693,7 +704,7 @@ class _IndicesNamespace:
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 60)
-    print("  ElastiPy — SOTA hnswlite Hybrid Search")
+    print("  ElastiPy — SOTA hnsw-lite Hybrid Search")
     print("=" * 60)
 
     es = ElastiPy()
