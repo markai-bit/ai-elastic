@@ -1,0 +1,211 @@
+
+
+## Phase 1: MVP1 — Document Extraction
+
+**Step 1 – Article PDF File:** The process begins with a raw regulatory article in PDF format.
+
+**Step 2 – PDF Parser/LLM extracts article text:** A PDF parser (or LLM) reads the PDF and extracts the article/sub-article text. This extracted text is validated on a regulation ingestion screen before moving forward.
+
+---
+
+## Phase 2: MVP2 — RAG Pipeline
+
+### Ingestion Side (building the knowledge base)
+
+**Step 3 – Upload Documents:** Internal/external guidance documents and CRR files are uploaded. The CCA team validates them on an ingestion screen before extraction begins.
+
+**Step 4 – PDF Parser extracts text:** The uploaded documents are parsed, producing extracted text along with internal/external guidance and CRR content.
+
+**Step 5 – Semantic Chunking + Metadata:** The extracted text is broken into semantically meaningful chunks, tagged with metadata (filename, assessment ID, sub-article ID).
+
+**Step 6 – Embedding Model (text-embedding-small-3):** Both the extracted text and the semantic chunks are fed into an embedding model, which converts them into numerical vector representations.
+
+**Step 7 – Semantic Chunks + Embeddings + Metadata:** The chunks, their embeddings, and metadata are combined into a unified package.
+
+**Step 8 → Step 9 – Stored in VectorDB:** Everything is indexed and stored in a Vector Database as "Vectorized Document Chunks & Indexed," making them searchable by similarity.
+
+---
+
+### Retrieval & Generation Side (answering queries)
+
+**Step 10 – Query enters the system:** A user query (or regulation article text from MVP1) is sent to the embedding model (Step 6) to create a query vector.
+
+**Step 11 – Vector similarity search:** The query vector is compared against the VectorDB to find the most similar document chunks.
+
+**Step 12 – Top-K relevant chunks retrieved:** The top-K most relevant chunks are pulled out and used as context for the LLM.
+
+**Step 13 – Prompt File:** A pre-written prompt template is loaded to structure how the LLM should respond.
+
+**Step 14 – Prompt + Context combined:** The prompt template (Step 13) and the retrieved chunks (Step 12) are merged together.
+
+**Step 15 – Model GPT 5.2 (first call):** The LLM receives the combined prompt + context and generates an initial **Synthesis Output** (Step 16) — a preliminary answer or position.
+
+---
+
+### Decision Logic Layer
+
+**Step 17 – Decision Logic Prompt:** A separate prompt (yet to be received from the POC team) will govern how the decision tree works.
+
+**Step 18 – Model GPT 5.2 (second call):** The synthesis output (Step 16) is fed into the LLM again, this time guided by the decision logic prompt.
+
+**Step 19 – Decision Logic & Tree:** The final output is a structured decision — the system determines a **final position** based on the regulation article, retrieved guidance documents, and the decision tree rules.
+
+---
+
+## 1. RAG (Retrieval-Augmented Generation)
+
+Instead of relying only on what the AI "memorized" during training, RAG first **retrieves** relevant documents from a database, then **generates** an answer using those documents as context.
+
+**Example:** You ask: *"What does Article 178 say about default definition?"* Instead of the AI guessing from memory, it first searches your internal guidance documents, finds the 3 most relevant paragraphs about Article 178, and then writes an answer based on those paragraphs. This means the answer is grounded in your actual documents, not hallucinated.
+
+---
+
+## 2. PDF Parser
+
+A tool that reads a PDF file and extracts the raw text from it, since PDFs store text in a format that isn't directly readable by code.
+
+**Example:** You have a 200-page CRR regulation PDF. The parser reads it and outputs clean text like: *"Article 178(1): A default shall be considered to have occurred when either or both of the following conditions are met..."* — stripping away headers, footers, page numbers, and formatting.
+
+---
+
+## 3. LLM (Large Language Model)
+
+An AI model (like GPT 5.2 in this diagram) trained on massive amounts of text that can understand and generate human language.
+
+**Example:** You feed the model extracted regulation text and ask: *"Summarize the key obligations under Article 178."* The LLM reads the text and writes a clear, structured summary in plain English.
+
+---
+
+## 4. Semantic Chunking
+
+Breaking a large document into smaller, **meaningful** pieces — not just splitting every 500 words blindly, but splitting where the topic naturally changes.
+
+**Example:** A guidance document covers three topics: definition of default, treatment of restructured exposures, and counting days past due. Semantic chunking would create three separate chunks, one per topic, rather than cutting mid-sentence at an arbitrary character limit. This way, when someone asks about "days past due," the system retrieves a chunk that contains the complete, coherent section on that topic.
+
+---
+
+## 5. Metadata
+
+Additional descriptive information attached to each chunk so the system knows **where it came from** and **what it relates to**.
+
+**Example:** A chunk about default definition would carry metadata like:
+- **Filename:** `CRR_Regulation_2024.pdf`
+- **Assessment ID:** `ASS-00452`
+- **Sub-article ID:** `Art_178_1`
+- **Document type:** External Guidance
+
+This helps the system filter results (e.g., show only internal guidance) and cite sources properly.
+
+---
+
+## 6. Embedding / Embedding Model (text-embedding-small-3)
+
+An embedding model converts text into a **list of numbers** (a vector) that captures its meaning. Texts with similar meaning get similar numbers.
+
+**Example:**
+- *"The borrower failed to pay for 90 days"* → `[0.82, 0.14, 0.67, ...]`
+- *"The debtor was past due for three months"* → `[0.81, 0.15, 0.66, ...]`
+- *"The weather is sunny today"* → `[0.12, 0.89, 0.03, ...]`
+
+Notice the first two sentences have very similar numbers because they mean nearly the same thing, even though the words are different. The third is completely different. This is how the system understands meaning, not just keyword matching.
+
+---
+
+## 7. Vector
+
+A list of numbers that represents a piece of text in mathematical space. Think of it as GPS coordinates, but instead of 2 dimensions (latitude, longitude), you have hundreds of dimensions capturing different aspects of meaning.
+
+**Example:** The sentence *"Credit risk assessment methodology"* might become a vector of 1,536 numbers. Each number captures some aspect — some dimensions relate to "finance," others to "risk," others to "process." You can't read these numbers directly, but the computer uses them to calculate similarity.
+
+---
+
+## 8. VectorDB (Vector Database)
+
+A specialized database designed to store vectors and quickly find the most similar ones. Traditional databases search by exact match (like SQL `WHERE name = 'John'`); vector databases search by **meaning similarity**.
+
+**Example:** Your VectorDB stores 50,000 chunks from all your regulation documents. When a query comes in, instead of keyword-searching for "default," it finds chunks whose *meaning* is closest to the query — so it would also find chunks that talk about "non-performing exposures" or "failure to meet obligations" even if they never use the word "default."
+
+---
+
+## 9. Vectorized Document Chunks & Indexed
+
+This means the chunks have been converted to vectors and organized (indexed) for fast searching — like a library catalogue that lets you find the right book in seconds instead of scanning every shelf.
+
+**Example:** All 50,000 chunks are now stored with their vectors and indexed. When a new query arrives, the system doesn't compare against all 50,000 one by one. The index uses smart mathematical shortcuts to narrow it down to the top matches almost instantly.
+
+---
+
+## 10. Vector Similarity Search
+
+The process of comparing a query vector against all stored vectors to find the closest matches, typically using a distance metric like **cosine similarity**.
+
+**Example:** Your query *"What is the treatment for technical defaults?"* is converted to a vector. The system calculates the "distance" between this vector and every chunk in the database. Chunks about technical defaults, curing periods, and immaterial past-due amounts score high similarity (e.g., 0.92, 0.89, 0.87). Chunks about market risk or liquidity ratios score low (e.g., 0.23, 0.11).
+
+---
+
+## 11. Top-K Relevant Chunks
+
+After similarity search, the system picks the **K most similar** chunks. K is a configurable number (commonly 3, 5, or 10).
+
+**Example:** With K=5, the system retrieves the 5 chunks most relevant to your query. For *"What triggers a default classification?"* it might return:
+1. CRR Art. 178(1) — definition of default
+2. Internal guidance — days past due threshold
+3. ECB guidance — unlikeliness to pay indicators
+4. Internal policy — materiality thresholds
+5. CRR Art. 178(3) — specific provisions
+
+These 5 chunks become the "context" the LLM reads before answering.
+
+---
+
+## 12. Prompt / Prompt File
+
+A carefully crafted instruction template that tells the LLM **how** to behave, what format to use, and what rules to follow.
+
+**Example:** A prompt file might say: *"You are a regulatory compliance expert. Given the following regulation text and internal guidance documents, analyze the article and determine the bank's required position. Always cite the specific article number. If guidance conflicts, flag it. Respond in the following format: Position, Rationale, References."*
+
+---
+
+## 13. Context (in LLM terms)
+
+The background information (retrieved chunks) that is fed to the LLM alongside the prompt so it can give an informed answer rather than relying on general knowledge.
+
+**Example:** The LLM receives:
+- **Prompt:** "Determine the bank's position on..."
+- **Context:** [5 retrieved chunks about default definition from your documents]
+- **Query:** "How should we treat a borrower who is 85 days past due?"
+
+Without context, the LLM might give a generic answer. With context, it answers based on your bank's specific internal policies and the actual CRR text.
+
+---
+
+## 14. Synthesis Output
+
+The first-pass answer generated by the LLM after reading the prompt and context. It "synthesizes" (combines and reasons over) all the retrieved information into a coherent response.
+
+**Example:** After processing 5 chunks, the model produces: *"Based on Article 178(1)(b) and internal policy GP-2024-03, a borrower at 85 days past due has not yet breached the 90-day threshold. However, the unlikeliness-to-pay indicators in the internal guidance should be assessed separately..."*
+
+---
+
+## 15. Decision Logic & Decision Tree
+
+A structured set of rules (if-then logic) that takes the synthesis output and maps it to a specific final decision or classification.
+
+**Example:**
+- **IF** the synthesis says the article applies to the bank **AND** internal guidance exists → Position: "Compliant with modifications"
+- **IF** the synthesis says the article doesn't apply → Position: "Not applicable"
+- **IF** there's a conflict between internal and external guidance → Position: "Requires escalation"
+
+This ensures consistent, rule-based final decisions rather than leaving it entirely to the LLM's judgment.
+
+---
+
+## 18. Ingestion
+
+The entire process of taking a raw document and preparing it for the system: parsing, chunking, embedding, and storing it in the vector database.
+
+**Example:** A new regulatory circular arrives. Ingestion means: parse the PDF → extract text → split into 47 semantic chunks → generate 47 vectors → store all 47 in the VectorDB with metadata. After ingestion, the document is "searchable" and can be retrieved when relevant queries come in.
+
+---
+
+This covers every key technical concept in the pipeline. The core idea is: documents go in, get broken into smart pieces, turned into numbers, and stored. When a question comes in, the system finds the most relevant pieces, feeds them to an LLM, and then applies decision rules to produce a consistent, traceable regulatory position.
