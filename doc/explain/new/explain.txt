@@ -1,502 +1,202 @@
+from __future__ import annotations
+
+import uuid
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Any, Iterable
+
+from elasticsearch import AsyncElasticsearch
+
+from app.config import get_settings
+from app.embeddings import Embedder
+from app.exceptions import IndexOperationError
+from app.hashing import content_hash
+from app.logging_config import get_logger
+from app.models import ChunkIn, ChunkOutcome, IngestRequest, IngestResponse
+
+log = get_logger(__name__)
 
 
-import os
-
-import json
-import asyncio
-import logging
-import re
-import platform
-from typing import List, Dict, Any
-
-import numpy as np
-import PyPDF2
-import requests
-from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
-from elasticsearch import AsyncElasticsearch, helpers
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-logger = logging.getLogger(__name__)
-
-ROUTER_SERVICE_ENDPOINT = os.getenv("ROUTER_SERVICE_ENDPOINT", "http://127.0.0.1:port")
-OPENAI_EMBED_MODEL = "text-embedding-3-small"
-HTTP_TIMEOUT_SECONDS = float(os.getenv("RAG_HTTP_TIMEOUT_SECONDS", "60"))
-
-ES_URL = "http://localhost:port"
-INDEX_NAME = "poc_policy_index"
-DUMMY_PDF_PATH = "sample_policy.pdf"
-EXPORT_JSON_PATH = "data_for_indexing.json"
-
-# Initialize Elasticsearch client and embedding model name
-es = AsyncElasticsearch(ES_URL, basic_auth=("elastic", ""))
-print("Loading embedding model (this takes a few seconds the first time)...")
-model = os.getenv("RAG_EMBED_MODEL", "text-embedding-3-small")
-
-# Lazy-loaded spaCy NLP instance
-_NLP = None
+# ES limits worth respecting:
+#   - index.max_terms_count (default 65,536)  -> cap on `terms` clause size
+#   - index.max_result_window (default 10,000) -> cap on `size`
+# We use 5,000 to stay well clear of both with headroom for future schema churn.
+_MAX_TERMS_PER_QUERY = 5000
 
 
-# ===========================================================================
-# SECTION 1: Embedding Utilities
-# ===========================================================================
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def get_embedding(text: str, model: str = OPENAI_EMBED_MODEL) -> list:
-    """Get embedding for a single text via the AI router service."""
-    url = f"{ROUTER_SERVICE_ENDPOINT}/ai-router-service/embedding/serial"
-    payload = {"model": model, "data": text}
-    response = requests.post(url, json=payload, timeout=HTTP_TIMEOUT_SECONDS)
-    if response.status_code in {401, 403}:
-        raise RuntimeError(
-            "Embedding authentication failed. Check router credentials / environment configuration."
+
+def _metadata_equal(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Strict equality on the union of keys. None == missing for robustness."""
+    keys = set(a.keys()) | set(b.keys())
+    return all(a.get(k) == b.get(k) for k in keys)
+
+
+def _batched(values: list, size: int) -> Iterable[list]:
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+async def _existing_docs_by_hash(
+    es: AsyncElasticsearch, index: str, hashes: list[str]
+) -> dict[str, list[dict[str, Any]]]:
+    """
+    One (or a few) `terms` query instead of N `term` queries.
+    Returns {content_hash: [source_doc, ...]} for every hash that had matches.
+    """
+    result: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    if not hashes:
+        return result
+
+    # Preserve order while deduping -- lets us not over-query on repeated hashes.
+    unique = list(dict.fromkeys(hashes))
+
+    for sub in _batched(unique, _MAX_TERMS_PER_QUERY):
+        resp = await es.search(
+            index=index,
+            query={"terms": {"content_hash": sub}},
+            size=_MAX_TERMS_PER_QUERY,
+            _source=True,
         )
-    response.raise_for_status()
-    return response.json().get("embedding", [])
+        for hit in resp["hits"]["hits"]:
+            doc = hit["_source"]
+            h = doc.get("content_hash")
+            if h:
+                result[h].append(doc)
+    return result
 
 
-def estimate_token_count(text: str) -> int:
-    """Approximate token count: ~1 token per 3 characters."""
-    return len(text) // 3
+def _build_doc(chunk: ChunkIn, hash_value: str, embedding: list[float]) -> dict[str, Any]:
+    return {
+        "chunk_id": uuid.uuid4().hex,
+        "content": chunk.content,
+        "content_hash": hash_value,
+        "embedding": embedding,
+        "metadata": chunk.metadata,
+        "ingested_at": _now_iso(),
+    }
 
 
-def get_embedding_model_info(model: str) -> dict:
-    """Fetch model metadata (batch size, token limit) from the router."""
-    url = f"{ROUTER_SERVICE_ENDPOINT}/ai-router-service/embedding/model-info"
-    params = {"model": model}
-    response = requests.get(url, params=params, timeout=HTTP_TIMEOUT_SECONDS)
-    if response.status_code in {401, 403}:
-        raise RuntimeError(
-            "Embedding authentication failed. Check router credentials / environment configuration."
-        )
-    if response.status_code == 200:
-        return response.json()
-    return {"max_batch_size": 16, "input_token_limit": 8192}
+async def ingest_chunks(
+    request: IngestRequest,
+    es: AsyncElasticsearch,
+    embedder: Embedder,
+    index_name: str | None = None,
+) -> IngestResponse:
+    settings = get_settings()
+    index = index_name or settings.index_name
 
+    # ---- Pass 1: hash every chunk (CPU only, no IO) --------------------------
+    chunk_hashes = [content_hash(c.content) for c in request.chunks]
 
-def get_batch_embeddings(texts: list, model: str = OPENAI_EMBED_MODEL) -> list:
-    """
-    Generate embeddings for a list of texts in batches.
-    Handles token limits, batch sizing, and fallback to serial embedding on errors.
-    """
-    valid_texts = [t for t in texts if isinstance(t, str) and t.strip()]
-    if not valid_texts:
-        return []
-
-    model_info = get_embedding_model_info(model)
-    max_batch_size = model_info.get("max_batch_size", 16)
-    input_token_limit = model_info.get("input_token_limit", 8192)
-    url = f"{ROUTER_SERVICE_ENDPOINT}/ai-router-service/embedding/batch"
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    embeddings = []
-    i = 0
-
-    while i < len(valid_texts):
-        # Optional progress logging
-        if os.getenv("RAG_EMBED_PROGRESS", "false").strip().lower() in {"1", "true", "yes"}:
-            logger.info("Embedding progress: %d texts pending...", len(valid_texts) - i)
-
-        # Build a batch that fits within token and size limits
-        batch = []
-        batch_token_count = 0
-        while len(batch) < max_batch_size and i < len(valid_texts):
-            text = valid_texts[i]
-            tokens = estimate_token_count(text)
-            if batch_token_count + tokens > input_token_limit:
-                break
-            batch.append(text)
-            batch_token_count += tokens
-            i += 1
-
-        # If a single text exceeds the token limit, truncate it
-        if not batch:
-            text = valid_texts[i]
-            tokens = estimate_token_count(text)
-            if tokens > input_token_limit:
-                text = text[: input_token_limit * 3]
-            batch = [text]
-            i += 1
-
-        # Send batch request
-        payload = {"model": model, "data_batch": batch}
-        response = requests.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT_SECONDS)
-
-        if response.status_code in {401, 403}:
-            raise RuntimeError(
-                "Embedding authentication failed. Check router credentials / environment configuration."
-            )
-
-        if response.status_code != 200:
-            logger.warning("Batch embedding error: %s %s", response.status_code, response.text)
-            # Fallback: serial embedding for each item in the failed batch
-            for text in batch:
-                try:
-                    emb = get_embedding(text, model)
-                except Exception as e:
-                    logger.warning("Serial embedding error: %s", e)
-                    emb = None
-                embeddings.append(emb)
-        else:
-            embeddings.extend(response.json().get("embeddings", [None] * len(batch)))
-
-    return embeddings
-
-
-# ===========================================================================
-# SECTION 2: PDF Parsing
-# ===========================================================================
-
-def parse_pdf(filepath: str) -> str:
-    """Extract raw text from a PDF file using PyPDF2."""
-    print(f"\n[1] Parsing PDF: {filepath}")
-    text = ""
-    with open(filepath, "rb") as file:
-        reader = PyPDF2.PdfReader(file)
-        for page in reader.pages:
-            text += page.extract_text() + "\n"
-    return text
-
-
-# ===========================================================================
-# SECTION 3: Text Chunking Strategies
-# ===========================================================================
-
-def chunking(text: str, chunk_size: int = 200, overlap: int = 50) -> List[str]:
-    """
-    Basic fixed-window chunking with word-level overlap.
-    Splits text into overlapping windows so context isn't lost.
-    """
-    print(f"[2] Performing Semantic Chunking (Target Size: {chunk_size} chars)...")
-    words = text.replace("\n", " ").split()
-    chunks = []
-    current_chunk = []
-    current_length = 0
-
-    for word in words:
-        current_chunk.append(word)
-        current_length += len(word) + 1  # +1 for space
-
-        if current_length >= chunk_size:
-            chunks.append(" ".join(current_chunk))
-            # Keep the last few words for overlap
-            overlap_words = current_chunk[-max(1, overlap // 5) :]
-            current_chunk = overlap_words
-            current_length = sum(len(w) + 1 for w in overlap_words)
-
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
-
-    print(f"    -> Generated {len(chunks)} chunks.")
-    return chunks
-
-
-def _get_nlp():
-    """Lazy-load spaCy English model for sentence splitting."""
-    global _NLP
-    if _NLP is not None:
-        return _NLP
+    # ---- Pass 2: ONE batched lookup (was N+1 before) -------------------------
     try:
-        import en_core_web_sm
+        existing_by_hash = await _existing_docs_by_hash(es, index, chunk_hashes)
+    except Exception as exc:  # noqa: BLE001 -- boundary with a flaky dependency
+        log.exception(
+            "dedup_lookup_failed",
+            extra={"index": index, "unique_hashes": len(set(chunk_hashes))},
+        )
+        # Treat whole-batch lookup failure as a hard error rather than marking
+        # every chunk as "failed" -- gives a more actionable response.
+        raise IndexOperationError(f"Dedup lookup failed: {exc}") from exc
 
-        _NLP = en_core_web_sm.load()
-    except Exception:
-        _NLP = None
-    return _NLP
+    # ---- Pass 3: route each chunk in memory (no IO) --------------------------
+    decisions: list[dict[str, Any]] = []
+    chunks_to_embed: list[tuple[int, ChunkIn, str]] = []  # (orig_idx, chunk, hash)
 
+    for i, (chunk, h) in enumerate(zip(request.chunks, chunk_hashes)):
+        existing = existing_by_hash.get(h, [])
 
-def _split_sentences(text: str) -> list:
-    """Split text into sentences using spaCy (preferred) or regex fallback."""
-    nlp = _get_nlp()
-    if nlp is not None:
-        doc = nlp(text)
-        return [s for s in (sent.text.strip() for sent in doc.sents) if s]
-    # Regex fallback: split on sentence-ending punctuation
-    parts = re.split(r"(?<=[.!?])\s+", text or "")
-    return [part.strip() for part in parts if part and part.strip()]
-
-
-def get_openai_embedding(text: str) -> list:
-    """Single-text embedding helper (convenience wrapper)."""
-    return get_embedding(text, OPENAI_EMBED_MODEL)
-
-
-def recursive_split(text: str, max_chunk_size: int = 1000) -> List[str]:
-    """Fallback chunking: split by paragraphs, then by sentences if too large."""
-    paragraphs = text.split("\n\n")
-    chunks = []
-    for para in paragraphs:
-        if len(para) <= max_chunk_size:
-            chunks.append(para)
-        else:
-            chunks.extend(para.split(". "))
-    return chunks
-
-
-def _cos_sim(a: list, b: list) -> float:
-    """Compute cosine similarity between two embedding vectors."""
-    va = np.asarray(a, dtype=np.float32).reshape(1, -1)
-    vb = np.asarray(b, dtype=np.float32).reshape(1, -1)
-    return float(cosine_similarity(va, vb)[0, 0])
-
-
-def _embed_sentences(sentences: list, model: str) -> list:
-    """Embed a list of sentences individually."""
-    return [get_embedding(s, model) for s in sentences]
-
-
-def semantic_chunk_text(
-    text: str, similarity_threshold: float = 0.75, max_chunk_size: int = 650
-) -> List[str]:
-    """
-    Semantically chunk text by comparing consecutive sentence embeddings.
-    Sentences are grouped together as long as:
-      - Their cosine similarity exceeds the threshold
-      - The chunk size stays under max_chunk_size
-    Falls back to recursive_split if embeddings fail.
-    """
-    sentences = _split_sentences(text)
-
-    if not sentences:
-        return []
-
-    embeddings = get_batch_embeddings(sentences, OPENAI_EMBED_MODEL)
-
-    # Defensive: if router returns fewer embeddings (or None entries), fall back
-    if (
-        not embeddings
-        or len(embeddings) != len(sentences)
-        or any(e is None for e in embeddings)
-    ):
-        return recursive_split(text, max_chunk_size=max_chunk_size)
-
-    chunks = []
-    current_chunk = []
-    current_length = 0
-
-    for i, sentence in enumerate(sentences):
-        sentence_len = len(sentence)
-
-        if not current_chunk:
-            current_chunk.append(sentence)
-            current_length += sentence_len
+        if not existing:
+            decisions.append({"action": "ingest", "hash": h, "status": "ingested"})
+            chunks_to_embed.append((i, chunk, h))
             continue
 
-        sim = _cos_sim(embeddings[i - 1], embeddings[i])
+        if not request.force_on_metadata_change:
+            decisions.append({
+                "action": "skip", "hash": h, "status": "skipped_duplicate",
+                "reason": f"content_hash already present ({len(existing)} doc(s))",
+            })
+            continue
 
-        if sim < similarity_threshold or current_length + sentence_len > max_chunk_size:
-            # Start a new chunk
-            chunks.append(" ".join(current_chunk))
-            current_chunk = [sentence]
-            current_length = sentence_len
+        # force_on_metadata_change=True
+        if any(_metadata_equal(chunk.metadata, doc.get("metadata", {})) for doc in existing):
+            decisions.append({
+                "action": "skip", "hash": h, "status": "skipped_duplicate",
+                "reason": "content_hash and metadata both already present",
+            })
         else:
-            current_chunk.append(sentence)
-            current_length += sentence_len
+            decisions.append({
+                "action": "ingest", "hash": h, "status": "ingested_new_metadata",
+            })
+            chunks_to_embed.append((i, chunk, h))
 
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
+    # ---- Pass 4: embed only what we're actually ingesting -------------------
+    embeddings: list[list[float]] = []
+    if chunks_to_embed:
+        embeddings = await embedder.embed([c.content for _, c, _ in chunks_to_embed])
 
-    return chunks
+    # ---- Pass 5: bulk index --------------------------------------------------
+    operations: list[dict[str, Any]] = []
+    chunk_ids: dict[int, str] = {}
+    for (orig_idx, chunk, h), emb in zip(chunks_to_embed, embeddings):
+        doc = _build_doc(chunk, h, emb)
+        chunk_ids[orig_idx] = doc["chunk_id"]
+        operations.append({"index": {"_index": index, "_id": doc["chunk_id"]}})
+        operations.append(doc)
 
-
-def add_overlap(chunks: List[str], overlap_sentences: int = 1) -> List[str]:
-    """
-    Add overlapping context between consecutive chunks by prepending the
-    last N sentences of the previous chunk to the current one.
-    """
-    new_chunks = []
-
-    for i in range(len(chunks)):
-        if i == 0:
-            new_chunks.append(chunks[i])
-        else:
-            prev_chunk = chunks[i - 1]
-            prev_sentences = _split_sentences(prev_chunk)
-            overlap = " ".join(prev_sentences[-overlap_sentences:])
-            new_chunk = overlap + " " + chunks[i]
-            new_chunks.append(new_chunk)
-
-    return new_chunks
-
-
-# ===========================================================================
-# SECTION 4: Indexing & Export
-# ===========================================================================
-
-def prepare_data_for_indexing(chunks: List[str]) -> List[Dict[str, Any]]:
-    """Generate vector embeddings for each chunk and format for Elasticsearch."""
-    print("[3] Generating Vector Embeddings using local MiniLM model...")
-
-    embeddings = get_batch_embeddings(chunks, model)
-
-    documents = []
-    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-        doc = {
-            "chunk_id": f"chunk_{i}",
-            "content": chunk,
-            "embedding": embedding,
-        }
-        documents.append(doc)
-
-    return documents
-
-
-def export_to_json(documents: List[Dict[str, Any]]):
-    """Save the indexing payload to a JSON file (embeddings truncated for readability)."""
-    print(f"[4] Saving indexing payload format to {EXPORT_JSON_PATH}...")
-    with open(EXPORT_JSON_PATH, "w") as f:
-        display_docs = []
-        for d in documents:
-            display_doc = d.copy()
-            display_doc["embedding"] = (
-                f"[{d['embedding'][0]:.4f}, {d['embedding'][1]:.4f}, ... (384 dimensions)]"
+    if operations:
+        try:
+            resp = await es.bulk(operations=operations, refresh="wait_for")
+        except Exception as exc:  # noqa: BLE001
+            log.exception("bulk_ingest_failed", extra={"index": index, "ops": len(operations)})
+            raise IndexOperationError(f"Bulk ingest failed: {exc}") from exc
+        if resp.get("errors"):
+            # Surface the first error for diagnosis but don't blow up the whole batch.
+            first_err = next(
+                (item for item in resp.get("items", []) if "error" in item.get("index", {})),
+                None,
             )
-            display_docs.append(display_doc)
-        json.dump(display_docs, f, indent=4)
+            log.warning("bulk_ingest_partial_failure", extra={"first_error": first_err})
 
+    # ---- Build response ------------------------------------------------------
+    # Note: per-chunk "failed" outcomes are no longer produced -- a dedup lookup
+    # failure now raises IndexOperationError (502), and bulk failures likewise.
+    # Left in the union type so we can reintroduce partial-failure reporting
+    # later without an API break.
+    outcomes: list[ChunkOutcome] = []
+    ingested = skipped = 0
+    for i, decision in enumerate(decisions):
+        if decision["action"] == "ingest":
+            outcomes.append(ChunkOutcome(
+                chunk_index=i,
+                status=decision["status"],
+                chunk_id=chunk_ids.get(i),
+                content_hash=decision["hash"],
+            ))
+            ingested += 1
+        else:  # skip
+            outcomes.append(ChunkOutcome(
+                chunk_index=i,
+                status="skipped_duplicate",
+                content_hash=decision["hash"],
+                reason=decision.get("reason"),
+            ))
+            skipped += 1
 
-# ===========================================================================
-# SECTION 5: Elasticsearch Index Setup & Ingestion
-# ===========================================================================
+    log.info("ingest_summary", extra={
+        "index": index, "total": len(request.chunks),
+        "ingested": ingested, "skipped": skipped,
+    })
 
-async def setup_elasticsearch_index():
-    """Create the Elasticsearch index with dense vector mapping for KNN search."""
-    print(f"\n[5] Setting up Elasticsearch Index '{INDEX_NAME}'...")
-
-    # Delete if exists for a clean POC run
-    if await es.indices.exists(index=INDEX_NAME):
-        await es.indices.delete(index=INDEX_NAME)
-
-    mapping = {
-        "mappings": {
-            "properties": {
-                "chunk_id": {"type": "keyword"},
-                "content": {"type": "text"},  # For BM25 Lexical Search
-                "embedding": {
-                    "type": "dense_vector",   # For Vector KNN Search
-                    "dims": 384,              # MiniLM model dimension size
-                    "index": True,
-                    "similarity": "cosine",   # Distance metric
-                },
-            }
-        }
-    }
-
-    await es.indices.create(index=INDEX_NAME, body=mapping)
-    print("    -> Index created successfully.")
-
-
-async def ingest_to_elasticsearch(documents: List[Dict[str, Any]]):
-    """Push all document chunks into Elasticsearch in bulk."""
-    print(f"[6] Ingesting {len(documents)} documents into Elasticsearch...")
-    actions = []
-    for doc in documents:
-        action = {
-            "_op_type": "index",
-            "_index": INDEX_NAME,
-            "_id": doc["chunk_id"],
-            "_source": doc,
-        }
-        actions.append(action)
-
-    await helpers.async_bulk(es, actions)
-    await es.indices.refresh(index=INDEX_NAME)  # Force refresh for immediate searchability
-    print("    -> Ingestion complete!")
-
-
-# ===========================================================================
-# SECTION 6: Hybrid Search (BM25 + KNN)
-# ===========================================================================
-
-async def hybrid_search(query: str, top_k: int = 10):
-    """
-    Perform hybrid search combining:
-      - BM25 lexical search (exact text matching)
-      - KNN vector search (semantic meaning)
-    Both are weighted equally (boost=0.5 each).
-    """
-    print(f"\n[7] Executing Hybrid Search for query: '{query}'")
-
-    # 1. Vectorize the search query
-    query_vector = get_embedding(query, model)
-
-    # 2. Build Hybrid Query (Supported in ES 8.x)
-    es_query = {
-        "size": top_k,
-        "query": {
-            # LEXICAL (BM25) SEARCH
-            "match": {
-                "content": {
-                    "query": query,
-                    "boost": 0.5,  # Weight for text match
-                }
-            }
-        },
-        "knn": {
-            # VECTOR (KNN) SEARCH
-            "field": "embedding",
-            "query_vector": query_vector,
-            "k": top_k,
-            "num_candidates": 50,
-            "boost": 0.5,  # Weight for vector meaning
-        },
-    }
-
-    response = await es.search(index=INDEX_NAME, body=es_query)
-
-    # 3. Display results
-    print("\n" + "=" * 40)
-    print(" HYBRID SEARCH RESULTS")
-    print("=" * 40)
-    for i, hit in enumerate(response["hits"]["hits"]):
-        score = hit["_score"]
-        content = hit["_source"]["content"]
-        print(f"Rank {i+1} | Score: {score:.4f}")
-        print(f"Content: {content}\n")
-
-
-# ===========================================================================
-# SECTION 7: Main Entry Point
-# ===========================================================================
-
-async def main():
-    try:
-        # Step 0: Ensure we have a PDF to read
-        PDF_PATH = "files\\Credit Risk_Exposure Classification.pdf"
-
-        # Step 1 & 2: Parse and Chunk
-        raw_text = parse_pdf(PDF_PATH)
-        chunks = semantic_chunk_text(raw_text, similarity_threshold=0.75, max_chunk_size=650)
-        print(f"\nGenerated {len(chunks)} semantically chunked pieces for indexing.")
-
-        # Step 3 & 4: Embed and Export Format
-        documents = prepare_data_for_indexing(chunks)
-        export_to_json(documents)
-        print(f"\nSample Document for Indexing:\n{json.dumps(documents[0], indent=4)}")
-
-        # Step 5 & 6: Elasticsearch Setup and Ingest
-        await setup_elasticsearch_index()
-        await ingest_to_elasticsearch(documents)
-
-        # Step 7: Perform Hybrid Search Tests
-        await hybrid_search(
-            "Article 143(1) of the CRR requires the Prudential Regulation Authority (PRA) "
-            "to grant permission to use the Internal Ratings Based (IRB) approach where it "
-            "is satisfied that the requirements of Title II Chapter 3 of the CRR are met. "
-            "The purpose of this supervisory statement is to provide explanation, where "
-            "appropriate, of the PRA's expectations when assessing whether firms meet those "
-            "requirements, including in respect of the conservatism applied."
-        )
-
-    except Exception as e:
-        print(e)
-    finally:
-        await es.close()
-
-
-if __name__ == "__main__":
-    # Workaround for async loop on Windows if applicable
-    if platform.system() == "Windows":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    asyncio.run(main())
+    return IngestResponse(
+        index=index,
+        total=len(request.chunks),
+        ingested=ingested,
+        skipped=skipped,
+        failed=0,
+        outcomes=outcomes,
+    )
