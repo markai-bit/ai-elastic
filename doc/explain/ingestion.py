@@ -1,10 +1,9 @@
-
-
 from __future__ import annotations
 
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterable
 
 from elasticsearch import AsyncElasticsearch
 
@@ -18,6 +17,13 @@ from app.models import ChunkIn, ChunkOutcome, IngestRequest, IngestResponse
 log = get_logger(__name__)
 
 
+# ES limits worth respecting:
+#   - index.max_terms_count (default 65,536)  -> cap on `terms` clause size
+#   - index.max_result_window (default 10,000) -> cap on `size`
+# We use 5,000 to stay well clear of both with headroom for future schema churn.
+_MAX_TERMS_PER_QUERY = 5000
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -28,17 +34,38 @@ def _metadata_equal(a: dict[str, Any], b: dict[str, Any]) -> bool:
     return all(a.get(k) == b.get(k) for k in keys)
 
 
-async def _existing_docs_for_hash(
-    es: AsyncElasticsearch, index: str, hash_value: str
-) -> list[dict[str, Any]]:
-    """Return _source for all existing docs whose content_hash matches."""
-    resp = await es.search(
-        index=index,
-        query={"term": {"content_hash": hash_value}},
-        size=50,  # cap; same-hash collisions should be tiny in practice
-        _source=True,
-    )
-    return [hit["_source"] for hit in resp["hits"]["hits"]]
+def _batched(values: list, size: int) -> Iterable[list]:
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+async def _existing_docs_by_hash(
+    es: AsyncElasticsearch, index: str, hashes: list[str]
+) -> dict[str, list[dict[str, Any]]]:
+    """
+    One (or a few) `terms` query instead of N `term` queries.
+    Returns {content_hash: [source_doc, ...]} for every hash that had matches.
+    """
+    result: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    if not hashes:
+        return result
+
+    # Preserve order while deduping -- lets us not over-query on repeated hashes.
+    unique = list(dict.fromkeys(hashes))
+
+    for sub in _batched(unique, _MAX_TERMS_PER_QUERY):
+        resp = await es.search(
+            index=index,
+            query={"terms": {"content_hash": sub}},
+            size=_MAX_TERMS_PER_QUERY,
+            _source=True,
+        )
+        for hit in resp["hits"]["hits"]:
+            doc = hit["_source"]
+            h = doc.get("content_hash")
+            if h:
+                result[h].append(doc)
+    return result
 
 
 def _build_doc(chunk: ChunkIn, hash_value: str, embedding: list[float]) -> dict[str, Any]:
@@ -61,18 +88,27 @@ async def ingest_chunks(
     settings = get_settings()
     index = index_name or settings.index_name
 
-    # ---- Pass 1: hash + dedup classification ---------------------------------
-    decisions: list[dict[str, Any]] = []  # parallel to request.chunks
-    chunks_to_embed: list[tuple[int, ChunkIn, str]] = []  # (idx, chunk, hash)
+    # ---- Pass 1: hash every chunk (CPU only, no IO) --------------------------
+    chunk_hashes = [content_hash(c.content) for c in request.chunks]
 
-    for i, chunk in enumerate(request.chunks):
-        h = content_hash(chunk.content)
-        try:
-            existing = await _existing_docs_for_hash(es, index, h)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("dedup_lookup_failed", extra={"chunk_index": i, "hash": h})
-            decisions.append({"action": "fail", "hash": h, "reason": f"dedup lookup failed: {exc}"})
-            continue
+    # ---- Pass 2: ONE batched lookup (was N+1 before) -------------------------
+    try:
+        existing_by_hash = await _existing_docs_by_hash(es, index, chunk_hashes)
+    except Exception as exc:  # noqa: BLE001 -- boundary with a flaky dependency
+        log.exception(
+            "dedup_lookup_failed",
+            extra={"index": index, "unique_hashes": len(set(chunk_hashes))},
+        )
+        # Treat whole-batch lookup failure as a hard error rather than marking
+        # every chunk as "failed" -- gives a more actionable response.
+        raise IndexOperationError(f"Dedup lookup failed: {exc}") from exc
+
+    # ---- Pass 3: route each chunk in memory (no IO) --------------------------
+    decisions: list[dict[str, Any]] = []
+    chunks_to_embed: list[tuple[int, ChunkIn, str]] = []  # (orig_idx, chunk, hash)
+
+    for i, (chunk, h) in enumerate(zip(request.chunks, chunk_hashes)):
+        existing = existing_by_hash.get(h, [])
 
         if not existing:
             decisions.append({"action": "ingest", "hash": h, "status": "ingested"})
@@ -86,7 +122,7 @@ async def ingest_chunks(
             })
             continue
 
-        # force_on_metadata_change=True path
+        # force_on_metadata_change=True
         if any(_metadata_equal(chunk.metadata, doc.get("metadata", {})) for doc in existing):
             decisions.append({
                 "action": "skip", "hash": h, "status": "skipped_duplicate",
@@ -98,12 +134,12 @@ async def ingest_chunks(
             })
             chunks_to_embed.append((i, chunk, h))
 
-    # ---- Pass 2: embed only what we're actually ingesting --------------------
+    # ---- Pass 4: embed only what we're actually ingesting -------------------
     embeddings: list[list[float]] = []
     if chunks_to_embed:
         embeddings = await embedder.embed([c.content for _, c, _ in chunks_to_embed])
 
-    # ---- Pass 3: bulk index --------------------------------------------------
+    # ---- Pass 5: bulk index --------------------------------------------------
     operations: list[dict[str, Any]] = []
     chunk_ids: dict[int, str] = {}
     for (orig_idx, chunk, h), emb in zip(chunks_to_embed, embeddings):
@@ -127,8 +163,12 @@ async def ingest_chunks(
             log.warning("bulk_ingest_partial_failure", extra={"first_error": first_err})
 
     # ---- Build response ------------------------------------------------------
+    # Note: per-chunk "failed" outcomes are no longer produced -- a dedup lookup
+    # failure now raises IndexOperationError (502), and bulk failures likewise.
+    # Left in the union type so we can reintroduce partial-failure reporting
+    # later without an API break.
     outcomes: list[ChunkOutcome] = []
-    ingested = skipped = failed = 0
+    ingested = skipped = 0
     for i, decision in enumerate(decisions):
         if decision["action"] == "ingest":
             outcomes.append(ChunkOutcome(
@@ -138,7 +178,7 @@ async def ingest_chunks(
                 content_hash=decision["hash"],
             ))
             ingested += 1
-        elif decision["action"] == "skip":
+        else:  # skip
             outcomes.append(ChunkOutcome(
                 chunk_index=i,
                 status="skipped_duplicate",
@@ -146,18 +186,10 @@ async def ingest_chunks(
                 reason=decision.get("reason"),
             ))
             skipped += 1
-        else:
-            outcomes.append(ChunkOutcome(
-                chunk_index=i,
-                status="failed",
-                content_hash=decision["hash"],
-                reason=decision.get("reason"),
-            ))
-            failed += 1
 
     log.info("ingest_summary", extra={
         "index": index, "total": len(request.chunks),
-        "ingested": ingested, "skipped": skipped, "failed": failed,
+        "ingested": ingested, "skipped": skipped,
     })
 
     return IngestResponse(
@@ -165,6 +197,6 @@ async def ingest_chunks(
         total=len(request.chunks),
         ingested=ingested,
         skipped=skipped,
-        failed=failed,
+        failed=0,
         outcomes=outcomes,
     )
