@@ -1,174 +1,27 @@
---------config----------
+---index_manager--------
 
-from __future__ import annotations
-
-import os
-from dataclasses import dataclass, field
-
-
-@dataclass
-class Settings:
-    es_url: str = field(default_factory=lambda: os.getenv("ES_URL", "http://localhost:9200"))
-    es_username: str = field(default_factory=lambda: os.getenv("ES_USERNAME", "elastic"))
-    es_password: str = field(default_factory=lambda: os.getenv("ES_PASSWORD", ""))
-    index_name: str = field(default_factory=lambda: os.getenv("INDEX_NAME", "poc_policy_index"))
-
-    embed_dimension: int = field(default_factory=lambda: int(os.getenv("EMBED_DIMENSION", "1536")))
-    embed_model: str = field(default_factory=lambda: os.getenv("EMBED_MODEL", "text-embedding-3-small"))
-
-    bm25_boost: float = field(default_factory=lambda: float(os.getenv("BM25_BOOST", "0.5")))
-    knn_boost: float = field(default_factory=lambda: float(os.getenv("KNN_BOOST", "0.5")))
-    knn_num_candidates: int = field(default_factory=lambda: int(os.getenv("KNN_NUM_CANDIDATES", "100")))
-
-    log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
-    request_timeout_seconds: float = field(
-        default_factory=lambda: float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
-    )
-
-
-def get_settings() -> Settings:
-    return Settings()
-
-
-
-
---------search_router----------
-from __future__ import annotations
-
-from fastapi import APIRouter, Depends
-
-from app.es_client import get_es_client
-from app.logging_config import get_logger
-from app.models import SearchRequest, SearchResponse
-from app.search import hybrid_search
-
-log = get_logger(__name__)
-
-router = APIRouter(prefix="/search", tags=["search"])
-
-
-@router.post(
-    "",
-    response_model=SearchResponse,
-    summary="Hybrid BM25 + KNN search (caller provides query embedding).",
-)
-async def search(
-    payload: SearchRequest,
-    es=Depends(get_es_client),
-) -> SearchResponse:
-    log.info(
-        "search_request_received",
-        extra={"top_k": payload.top_k, "filters": list(payload.filters.keys())},
-    )
-    return await hybrid_search(payload, es=es)
-
-
-
---------ingestion_router-----------------
-from __future__ import annotations
-
-from fastapi import APIRouter, Depends, status
-
-from app.es_client import get_es_client
-from app.index_manager import ensure_index
-from app.ingestion import ingest_records
-from app.logging_config import get_logger
-from app.models import IngestRequest, IngestResponse
-
-log = get_logger(__name__)
-
-router = APIRouter(prefix="/ingestion", tags=["ingestion"])
-
-
-@router.post(
-    "/index",
-    status_code=status.HTTP_201_CREATED,
-    summary="Create the index if it doesn't exist (idempotent).",
-)
-async def create_index(recreate: bool = False, es=Depends(get_es_client)):
-    return await ensure_index(es, recreate=recreate)
-
-
-@router.post(
-    "",
-    response_model=IngestResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Ingest records (caller provides embeddings).",
-)
-async def ingest(
-    payload: IngestRequest,
-    es=Depends(get_es_client),
-) -> IngestResponse:
-    log.info(
-        "ingest_request_received",
-        extra={"records": len(payload.records), "force_on_metadata_change": payload.force_on_metadata_change},
-    )
-    return await ingest_records(payload, es=es)
-
-
--------search.py---------
-from __future__ import annotations
-
-from typing import Any
-
-from elasticsearch import AsyncElasticsearch
-from elasticsearch import NotFoundError as ESNotFoundError
-
-from app.config import get_settings
-from app.exceptions import IndexNotFoundError, SearchError
-from app.logging_config import get_logger
-from app.models import SearchHit, SearchRequest, SearchResponse
-
-log = get_logger(__name__)
-
-
-def _filter_clauses(filters: dict[str, Any]) -> list[dict[str, Any]]:
-    """
-    Translate {field: value} into ES term/terms clauses on metadata.<field>.keyword.
-    The .keyword subfield is required because dynamic-mapped strings are `text`,
-    which doesn't support exact-match term queries reliably.
-    """
-    clauses: list[dict[str, Any]] = []
-    for field, value in filters.items():
-        es_field = f"metadata.{field}.keyword" if isinstance(value, (str, list)) else f"metadata.{field}"
-        if isinstance(value, list):
-            clauses.append({"terms": {es_field: value}})
-        else:
-            clauses.append({"term": {es_field: value}})
-    return clauses
-
-
-def build_hybrid_query(
-    *,
-    query_text: str,
-    query_vector: list[float],
-    top_k: int,
-    filters: dict[str, Any],
-    bm25_boost: float,
-    knn_boost: float,
-    knn_num_candidates: int,
-) -> dict[str, Any]:
-    filter_clauses = _filter_clauses(filters)
-
-    bm25_query: dict[str, Any] = {
-        "bool": {
-            "must":   [{"match": {"content": {"query": query_text, "boost": bm25_boost}}}],
-            "filter": filter_clauses,
-        }
+def _core_properties(embed_dimension: int) -> dict[str, Any]:
+    """Reserved fields always present, regardless of metadata content."""
+    return {
+        "chunk_id":     {"type": "keyword"},
+        "content":      {"type": "text"},
+        "content_hash": {"type": "keyword"},
+        "embedding":    {
+            "type": "dense_vector",
+            "dims": embed_dimension,
+            "index": True,
+            "similarity": "cosine",
+            "index_options": {
+                "type": "hnsw",
+                "m": 16,
+                "ef_construction": 100,
+            },
+        },
+        "ingested_at":  {"type": "date"},
     }
 
-    knn_query: dict[str, Any] = {
-        "field": "embedding",
-        "query_vector": query_vector,
-        "k": top_k,
-        "num_candidates": max(knn_num_candidates, top_k * 10),
-        "boost": knn_boost,
-    }
-    if filter_clauses:
-        knn_query["filter"] = filter_clauses
 
-    return {"size": top_k, "query": bm25_query, "knn": knn_query}
-
+---------search--------
 
 async def hybrid_search(
     request: SearchRequest,
@@ -189,6 +42,9 @@ async def hybrid_search(
     )
 
     try:
+        # In 8.6.2, knn is passed as a top-level kwarg to search().
+        # body= is deprecated in 8.13+ but still supported in 8.6.2.
+        # We pass the components explicitly to avoid relying on body=.
         resp = await es.search(
             index=index,
             query=body["query"],
@@ -219,423 +75,55 @@ async def hybrid_search(
 
     return SearchResponse(query=request.query, total_hits=len(hits), hits=hits)
 
-
--------------ingestion.py---------------
-from __future__ import annotations
-
-import uuid
-from collections import defaultdict
-from datetime import datetime, timezone
-from typing import Any, Iterable
-
-from elasticsearch import AsyncElasticsearch
-from elasticsearch import NotFoundError as ESNotFoundError
-
-from app.config import get_settings
-from app.exceptions import IndexOperationError
-from app.hashing import content_hash
-from app.index_manager import ensure_index
-from app.logging_config import get_logger
-from app.models import IngestRequest, IngestResponse, RecordIn, RecordOutcome
-
-log = get_logger(__name__)
-
-_MAX_TERMS_PER_QUERY = 5000
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _flatten_metadata(record: RecordIn) -> dict[str, Any]:
-    """
-    Merge top-level extra fields and the nested `metadata` block into one flat
-    metadata dict. Nested metadata keys win on collision (they're canonical).
-    `embedding` and `embedding_input` are excluded — they are core fields.
-    """
-    extras: dict[str, Any] = dict(record.model_extra or {})
-    nested = extras.pop("metadata", {}) or {}
-    if not isinstance(nested, dict):
-        nested = {}
-    return {**extras, **nested}
-
-
-def _metadata_equal(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    """Strict equality ignoring keys whose value is None on either side."""
-    a_clean = {k: v for k, v in a.items() if v is not None}
-    b_clean = {k: v for k, v in b.items() if v is not None}
-    return a_clean == b_clean
-
-
-def _is_missing_index_error(exc: ESNotFoundError, expected_index: str) -> bool:
-    body = getattr(exc, "body", None) or getattr(exc, "info", None) or {}
-    err = body.get("error", {}) if isinstance(body, dict) else {}
-    if err.get("type") == "index_not_found_exception":
-        if err.get("index") == expected_index or err.get("resource.id") == expected_index:
-            return True
-    msg = str(exc)
-    return "index_not_found_exception" in msg and f"[{expected_index}]" in msg
-
-
-def _batched(values: list, size: int) -> Iterable[list]:
-    for start in range(0, len(values), size):
-        yield values[start:start + size]
-
-
-async def _existing_docs_by_hash(
-    es: AsyncElasticsearch, index: str, hashes: list[str]
-) -> dict[str, list[dict[str, Any]]]:
-    result: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    if not hashes:
-        return result
-    unique = list(dict.fromkeys(hashes))
-    for sub in _batched(unique, _MAX_TERMS_PER_QUERY):
-        resp = await es.search(
-            index=index,
-            query={"terms": {"content_hash": sub}},
-            size=_MAX_TERMS_PER_QUERY,
-            _source=True,
-        )
-        for hit in resp["hits"]["hits"]:
-            doc = hit["_source"]
-            h = doc.get("content_hash")
-            if h:
-                result[h].append(doc)
-    return result
-
-
-def _build_doc(record: RecordIn, hash_value: str, metadata: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "chunk_id": uuid.uuid4().hex,
-        "content": record.embedding_input,
-        "content_hash": hash_value,
-        "embedding": record.embedding,
-        "metadata": metadata,
-        "ingested_at": _now_iso(),
-    }
-
-
-async def ingest_records(
-    request: IngestRequest,
-    es: AsyncElasticsearch,
-    index_name: str | None = None,
-) -> IngestResponse:
-    settings = get_settings()
-    index = index_name or settings.index_name
-
-    # Pass 1: hash + flatten metadata for every record (CPU only)
-    record_hashes = [content_hash(r.embedding_input) for r in request.records]
-    flattened = [_flatten_metadata(r) for r in request.records]
-
-    # Pass 2: batched dedup lookup, with lazy index creation on first ingest
-    try:
-        existing_by_hash = await _existing_docs_by_hash(es, index, record_hashes)
-    except ESNotFoundError as exc:
-        if not _is_missing_index_error(exc, index):
-            log.exception(
-                "dedup_lookup_failed",
-                extra={"index": index, "unique_hashes": len(set(record_hashes))},
-            )
-            raise IndexOperationError(f"Dedup lookup failed: {exc}") from exc
-        log.info("index_missing_creating_on_demand", extra={"index": index})
-        await ensure_index(es, index_name=index)
-        existing_by_hash = {}
-    except Exception as exc:  # noqa: BLE001
-        log.exception(
-            "dedup_lookup_failed",
-            extra={"index": index, "unique_hashes": len(set(record_hashes))},
-        )
-        raise IndexOperationError(f"Dedup lookup failed: {exc}") from exc
-
-    # Pass 3: route each record in memory
-    decisions: list[dict[str, Any]] = []
-    records_to_write: list[tuple[int, RecordIn, str, dict[str, Any]]] = []
-
-    for i, (record, h, meta) in enumerate(zip(request.records, record_hashes, flattened)):
-        existing = existing_by_hash.get(h, [])
-
-        if not existing:
-            decisions.append({"action": "write", "hash": h, "status": "ingested"})
-            records_to_write.append((i, record, h, meta))
-            continue
-
-        if not request.force_on_metadata_change:
-            decisions.append({
-                "action": "skip", "hash": h, "status": "skipped_duplicate",
-                "reason": f"content_hash already present ({len(existing)} doc(s))",
-            })
-            continue
-
-        if any(_metadata_equal(meta, doc.get("metadata", {})) for doc in existing):
-            decisions.append({
-                "action": "skip", "hash": h, "status": "skipped_duplicate",
-                "reason": "content_hash and metadata both already present",
-            })
-        else:
-            decisions.append({"action": "write", "hash": h, "status": "ingested_new_metadata"})
-            records_to_write.append((i, record, h, meta))
-
-    # Pass 4: bulk index (no embed step — embeddings come from the caller)
-    operations: list[dict[str, Any]] = []
-    chunk_ids: dict[int, str] = {}
-    for orig_idx, record, h, meta in records_to_write:
-        doc = _build_doc(record, h, meta)
-        chunk_ids[orig_idx] = doc["chunk_id"]
-        operations.append({"index": {"_index": index, "_id": doc["chunk_id"]}})
-        operations.append(doc)
-
-    if operations:
-        try:
-            resp = await es.bulk(operations=operations, refresh="wait_for")
-        except Exception as exc:  # noqa: BLE001
-            log.exception("bulk_ingest_failed", extra={"index": index, "ops": len(operations)})
-            raise IndexOperationError(f"Bulk ingest failed: {exc}") from exc
-        if resp.get("errors"):
-            first_err = next(
-                (item for item in resp.get("items", []) if "error" in item.get("index", {})),
-                None,
-            )
-            log.warning("bulk_ingest_partial_failure", extra={"first_error": first_err})
-
-    # Build response
-    outcomes: list[RecordOutcome] = []
-    ingested = skipped = 0
-    for i, decision in enumerate(decisions):
-        if decision["action"] == "write":
-            outcomes.append(RecordOutcome(
-                record_index=i,
-                status=decision["status"],
-                chunk_id=chunk_ids.get(i),
-                content_hash=decision["hash"],
-            ))
-            ingested += 1
-        else:
-            outcomes.append(RecordOutcome(
-                record_index=i,
-                status="skipped_duplicate",
-                content_hash=decision["hash"],
-                reason=decision.get("reason"),
-            ))
-            skipped += 1
-
-    log.info("ingest_summary", extra={
-        "index": index, "total": len(request.records),
-        "ingested": ingested, "skipped": skipped,
-    })
-
-    return IngestResponse(
-        index=index,
-        total=len(request.records),
-        ingested=ingested,
-        skipped=skipped,
-        failed=0,
-        outcomes=outcomes,
-    )
-
----------index_manager-------------------
-from __future__ import annotations
-
-from typing import Any
-
-from elasticsearch import AsyncElasticsearch
-from elasticsearch import NotFoundError as ESNotFoundError
-
-from app.config import get_settings
-from app.exceptions import IndexOperationError
-from app.logging_config import get_logger
-
-log = get_logger(__name__)
-
-
-def _core_properties(embed_dimension: int) -> dict[str, Any]:
-    """Reserved fields always present, regardless of metadata content."""
-    return {
-        "chunk_id":     {"type": "keyword"},
-        "content":      {"type": "text"},
-        "content_hash": {"type": "keyword"},
-        "embedding":    {
-            "type": "dense_vector",
-            "dims": embed_dimension,
-            "index": True,
-            "similarity": "cosine",
-        },
-        "ingested_at":  {"type": "date"},
-    }
-
-
-def build_index_mapping(embed_dimension: int) -> dict[str, Any]:
-    """
-    Compose the full ES mapping.
-
-    Core fields are strictly typed. The `metadata` object is dynamic — any
-    fields the upstream sends through end up there with ES-inferred types.
-    Strings default to `text` with a `.keyword` subfield via the dynamic
-    template, so filtering on `metadata.<field>.keyword` works at search time.
-    """
-    return {
-        "dynamic": "strict",  # rejects unknown TOP-LEVEL fields
-        "dynamic_templates": [
-            {
-                "metadata_strings_as_keyword_and_text": {
-                    "path_match": "metadata.*",
-                    "match_mapping_type": "string",
-                    "mapping": {
-                        "type": "text",
-                        "fields": {
-                            "keyword": {"type": "keyword", "ignore_above": 1024}
-                        },
-                    },
-                }
-            }
-        ],
-        "properties": {
-            **_core_properties(embed_dimension),
-            "metadata": {
-                "type": "object",
-                "dynamic": True,  # accept arbitrary keys under metadata.*
-            },
-        },
-    }
-
-
-async def ensure_index(
-    es: AsyncElasticsearch,
-    index_name: str | None = None,
-    embed_dimension: int | None = None,
-    recreate: bool = False,
+def build_hybrid_query(
+    *,
+    query_text: str,
+    query_vector: list[float],
+    top_k: int,
+    filters: dict[str, Any],
+    bm25_boost: float,
+    knn_boost: float,
+    knn_num_candidates: int,
 ) -> dict[str, Any]:
+    filter_clauses = _filter_clauses(filters)
+
+    bm25_query: dict[str, Any] = {
+        "bool": {
+            "must":   [{"match": {"content": {"query": query_text, "boost": bm25_boost}}}],
+            "filter": filter_clauses,
+        }
+    }
+
+    knn_query: dict[str, Any] = {
+        "field": "embedding",
+        "query_vector": query_vector,
+        "k": top_k,
+        "num_candidates": max(knn_num_candidates, top_k * 10),
+        "boost": knn_boost,
+    }
+    
+    if filter_clauses:
+        if len(filter_clauses) == 1:
+            knn_query["filter"] = filter_clauses[0]
+        else:
+            knn_query["filter"] = {"bool": {"filter": filter_clauses}}
+
+    return {"size": top_k, "query": bm25_query, "knn": knn_query}
+
+
+
+----------es_client---------
+def build_es_client() -> AsyncElasticsearch:
     settings = get_settings()
-    name = index_name or settings.index_name
-    dims = embed_dimension or settings.embed_dimension
-
-    try:
-        exists = await es.indices.exists(index=name)
-        if exists:
-            if not recreate:
-                log.info("index_already_exists", extra={"index": name})
-                return {"index": name, "created": False, "recreated": False}
-            await es.indices.delete(index=name)
-            log.info("index_deleted_for_recreate", extra={"index": name})
-
-        mapping = build_index_mapping(dims)
-        await es.indices.create(index=name, mappings=mapping)
-        log.info("index_created", extra={"index": name, "embed_dimension": dims})
-        return {"index": name, "created": True, "recreated": exists}
-    except ESNotFoundError as exc:
-        raise IndexOperationError(f"Index not found: {name}") from exc
-    except Exception as exc:  # noqa: BLE001
-        log.exception("index_create_failed", extra={"index": name})
-        raise IndexOperationError(f"Failed to ensure index '{name}': {exc}") from exc
-
-----------------models------------------
-
-from __future__ import annotations
-
-from typing import Any, Literal
-
-from pydantic import BaseModel, Field, field_validator
+    auth = None
+    if settings.es_password:
+        auth = (settings.es_username, settings.es_password)
+    return AsyncElasticsearch(
+        settings.es_url,
+        basic_auth=auth,
+        request_timeout=settings.request_timeout_seconds,
+    )
+    
 
 
-# ---------------------------------------------------------------------------
-# Ingestion
-# ---------------------------------------------------------------------------
 
-
-class RecordIn(BaseModel):
-    """
-    A single input record from the upstream extractor.
-
-    Two fields are special:
-      - `embedding_input`: the canonical text representation. Becomes `content`
-        on the ES doc and is the basis for the dedup hash.
-      - `embedding`: the precomputed vector. Stored directly; no router call.
-
-    Everything else (top-level fields like `doc_id`, `chunk_type`, `section_path`,
-    plus the nested `metadata` block) is merged into a single flat `metadata`
-    object on the ES doc. Nested `metadata.*` keys win on collisions with
-    top-level keys (they are the canonical source per the upstream contract).
-    """
-    model_config = {"extra": "allow"}  # accept arbitrary upstream fields
-
-    embedding_input: str = Field(..., min_length=1)
-    embedding: list[float] = Field(..., min_length=1)
-
-    @field_validator("embedding")
-    @classmethod
-    def _check_embedding(cls, v: list[float]) -> list[float]:
-        if not all(isinstance(x, (int, float)) for x in v):
-            raise ValueError("embedding must contain only numbers")
-        return v
-
-
-class IngestRequest(BaseModel):
-    records: list[RecordIn] = Field(..., min_length=1)
-    # If True, re-ingest as a new doc when an incoming record's flattened
-    # metadata differs from any existing doc with the same content_hash.
-    force_on_metadata_change: bool = False
-
-
-class RecordOutcome(BaseModel):
-    record_index: int
-    status: Literal["ingested", "skipped_duplicate", "ingested_new_metadata", "failed"]
-    chunk_id: str | None = None
-    content_hash: str
-    reason: str | None = None
-
-
-class IngestResponse(BaseModel):
-    index: str
-    total: int
-    ingested: int
-    skipped: int
-    failed: int
-    outcomes: list[RecordOutcome]
-
-
-# ---------------------------------------------------------------------------
-# Search
-# ---------------------------------------------------------------------------
-
-
-class SearchRequest(BaseModel):
-    """
-    Hybrid search request. The caller is responsible for providing both the
-    raw query text (used for BM25) and the precomputed query embedding (used
-    for KNN). This service does not call any embedding provider.
-    """
-    query: str = Field(..., min_length=1)
-    query_embedding: list[float] = Field(..., min_length=1)
-    top_k: int = Field(10, ge=1, le=100)
-    filters: dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("query_embedding")
-    @classmethod
-    def _check_query_embedding(cls, v: list[float]) -> list[float]:
-        if not all(isinstance(x, (int, float)) for x in v):
-            raise ValueError("query_embedding must contain only numbers")
-        return v
-
-
-class SearchHit(BaseModel):
-    chunk_id: str
-    score: float
-    content: str
-    metadata: dict[str, Any]
-
-
-class SearchResponse(BaseModel):
-    query: str
-    total_hits: int
-    hits: list[SearchHit]
-
-
-# ---------------------------------------------------------------------------
-# Errors
-# ---------------------------------------------------------------------------
-
-
-class ErrorResponse(BaseModel):
-    error_code: str
-    message: str
-    details: dict[str, Any] = Field(default_factory=dict)
-    correlation_id: str | None = None
