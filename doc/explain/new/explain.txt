@@ -1,129 +1,84 @@
----index_manager--------
+failed_chunk_ids: set[str] = set()
 
-def _core_properties(embed_dimension: int) -> dict[str, Any]:
-    """Reserved fields always present, regardless of metadata content."""
-    return {
-        "chunk_id":     {"type": "keyword"},
-        "content":      {"type": "text"},
-        "content_hash": {"type": "keyword"},
-        "embedding":    {
-            "type": "dense_vector",
-            "dims": embed_dimension,
-            "index": True,
-            "similarity": "cosine",
-            "index_options": {
-                "type": "hnsw",
-                "m": 16,
-                "ef_construction": 100,
-            },
-        },
-        "ingested_at":  {"type": "date"},
-    }
-
-
----------search--------
-
-async def hybrid_search(
-    request: SearchRequest,
-    es: AsyncElasticsearch,
-    index_name: str | None = None,
-) -> SearchResponse:
-    settings = get_settings()
-    index = index_name or settings.index_name
-
-    body = build_hybrid_query(
-        query_text=request.query,
-        query_vector=request.query_embedding,
-        top_k=request.top_k,
-        filters=request.filters,
-        bm25_boost=settings.bm25_boost,
-        knn_boost=settings.knn_boost,
-        knn_num_candidates=settings.knn_num_candidates,
-    )
-
+if operations:
     try:
-        # In 8.6.2, knn is passed as a top-level kwarg to search().
-        # body= is deprecated in 8.13+ but still supported in 8.6.2.
-        # We pass the components explicitly to avoid relying on body=.
-        resp = await es.search(
-            index=index,
-            query=body["query"],
-            knn=body["knn"],
-            size=body["size"],
-        )
-    except ESNotFoundError as exc:
-        raise IndexNotFoundError(f"Index not found: {index}") from exc
+        resp = await es.bulk(operations=operations, refresh="wait_for")
     except Exception as exc:  # noqa: BLE001
-        log.exception("search_failed", extra={"index": index, "query": request.query})
-        raise SearchError(f"Elasticsearch search failed: {exc}") from exc
+        log.exception("bulk_ingest_failed", extra={"index": index, "ops": len(operations)})
+        raise IndexOperationError(f"Bulk ingest failed: {exc}") from exc
 
-    hits_raw = resp.get("hits", {}).get("hits", [])
-    hits = [
-        SearchHit(
-            chunk_id=h["_source"].get("chunk_id", h["_id"]),
-            score=h["_score"],
-            content=h["_source"].get("content", ""),
-            metadata=h["_source"].get("metadata", {}),
+    if resp.get("errors"):
+        # Walk every item and collect the ones that actually failed.
+        items = resp.get("items", [])
+        first_err = None
+        for item in items:
+            op = item.get("index") or item.get("create") or {}
+            if "error" in op:
+                failed_chunk_ids.add(op.get("_id"))
+                if first_err is None:
+                    first_err = op.get("error")
+
+        log.error(
+            "bulk_ingest_partial_failure",
+            extra={
+                "index": index,
+                "total_ops": len(operations) // 2,
+                "failed_count": len(failed_chunk_ids),
+                "first_error": first_err,
+            },
         )
-        for h in hits_raw
-    ]
 
-    log.info(
-        "search_completed",
-        extra={"index": index, "query": request.query, "hits": len(hits), "top_k": request.top_k},
-    )
+        # If literally every write failed, this isn't partial — it's total.
+        # Raise so the caller gets a clear 502 instead of a misleading 200.
+        if len(failed_chunk_ids) == len(chunks_to_embed):
+            raise IndexOperationError(
+                f"All {len(failed_chunk_ids)} bulk writes failed. First error: {first_err}"
+            )
 
-    return SearchResponse(query=request.query, total_hits=len(hits), hits=hits)
 
-def build_hybrid_query(
-    *,
-    query_text: str,
-    query_vector: list[float],
-    top_k: int,
-    filters: dict[str, Any],
-    bm25_boost: float,
-    knn_boost: float,
-    knn_num_candidates: int,
-) -> dict[str, Any]:
-    filter_clauses = _filter_clauses(filters)
 
-    bm25_query: dict[str, Any] = {
-        "bool": {
-            "must":   [{"match": {"content": {"query": query_text, "boost": bm25_boost}}}],
-            "filter": filter_clauses,
-        }
-    }
 
-    knn_query: dict[str, Any] = {
-        "field": "embedding",
-        "query_vector": query_vector,
-        "k": top_k,
-        "num_candidates": max(knn_num_candidates, top_k * 10),
-        "boost": knn_boost,
-    }
-    
-    if filter_clauses:
-        if len(filter_clauses) == 1:
-            knn_query["filter"] = filter_clauses[0]
+
+
+--------------------------------------------------
+
+
+outcomes: list[RecordOutcome] = []
+ingested = skipped = failed = 0
+for i, decision in enumerate(decisions):
+    if decision["action"] == "write":
+        chunk_id = chunk_ids.get(i)
+        if chunk_id in failed_chunk_ids:
+            outcomes.append(RecordOutcome(
+                record_index=i,
+                status="failed",
+                chunk_id=chunk_id,
+                content_hash=decision["hash"],
+                reason="Bulk write rejected by Elasticsearch",
+            ))
+            failed += 1
         else:
-            knn_query["filter"] = {"bool": {"filter": filter_clauses}}
+            outcomes.append(RecordOutcome(
+                record_index=i,
+                status=decision["status"],
+                chunk_id=chunk_id,
+                content_hash=decision["hash"],
+            ))
+            ingested += 1
+    else:
+        outcomes.append(RecordOutcome(
+            record_index=i,
+            status="skipped_duplicate",
+            content_hash=decision["hash"],
+            reason=decision.get("reason"),
+        ))
+        skipped += 1
 
-    return {"size": top_k, "query": bm25_query, "knn": knn_query}
-
-
-
-----------es_client---------
-def build_es_client() -> AsyncElasticsearch:
-    settings = get_settings()
-    auth = None
-    if settings.es_password:
-        auth = (settings.es_username, settings.es_password)
-    return AsyncElasticsearch(
-        settings.es_url,
-        basic_auth=auth,
-        request_timeout=settings.request_timeout_seconds,
-    )
-    
-
-
-
+return IngestResponse(
+    index=index,
+    total=len(request.records),
+    ingested=ingested,
+    skipped=skipped,
+    failed=failed,    # was hardcoded 0 before
+    outcomes=outcomes,
+)
