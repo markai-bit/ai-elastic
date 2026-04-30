@@ -1,36 +1,21 @@
-from fastapi import Depends
+def _raise_http_from_rag(exc: RagError) -> None:
+    """Convert a domain RagError into a FastAPI HTTPException with structured detail."""
+    logger.warning(
+        "rag_domain_error",
+        error_code=exc.error_code,
+        error_message=exc.message,
+        details=exc.details,
+    )
+    raise HTTPException(
+        status_code=exc.http_status,
+        detail={
+            "error_code": exc.error_code,
+            "message": exc.message,
+            "details": exc.details,
+        },
+    ) from exc
 
-from app.src.elasticsearch_rag.es_client import get_es_client
-from app.src.elasticsearch_rag.ingestion import ingest_records
-from app.src.elasticsearch_rag.search import hybrid_search
-from app.src.elasticsearch_rag.models import (
-    IngestRequest,
-    IngestResponse,
-    SearchRequest,
-    SearchResponse,
-)
-
-----------------------------------------------
-import os
-from fastapi import APIRouter, Depends
-from typing import Optional
-from pathlib import Path
-
-from app.common.logger import get_logger
-from app.src.chunking_pipeline import _run_extract_structure_chunking
-
-from app.src.elasticsearch_rag.es_client import get_es_client
-from app.src.elasticsearch_rag.ingestion import ingest_records
-from app.src.elasticsearch_rag.search import hybrid_search
-from app.src.elasticsearch_rag.models import (
-    IngestRequest,
-    IngestResponse,
-    SearchRequest,
-    SearchResponse,
-)
-
-
----------------------------------------------------
+---------------------------
 
 @router.post(
     "/ingestion",
@@ -43,16 +28,17 @@ async def ingest(
 ) -> IngestResponse:
     logger.info(
         "ingest_request_received",
-        extra={
-            "records": len(payload.records),
-            "force_on_metadata_change": payload.force_on_metadata_change,
-        },
+        records=len(payload.records),
+        force_on_metadata_change=payload.force_on_metadata_change,
     )
-    return await ingest_records(payload, es=es)
+    try:
+        return await ingest_records(payload, es=es)
+    except RagError as exc:
+        _raise_http_from_rag(exc)
 
 
+-------------------------------------------
 
-------------------------------------------------------------------------
 @router.post(
     "/search",
     response_model=SearchResponse,
@@ -64,11 +50,16 @@ async def search(
 ) -> SearchResponse:
     logger.info(
         "search_request_received",
-        extra={"top_k": payload.top_k, "filters": list(payload.filters.keys())},
+        top_k=payload.top_k,
+        filters=list(payload.filters.keys()),
     )
-    return await hybrid_search(payload, es=es)
+    try:
+        return await hybrid_search(payload, es=es)
+    except RagError as exc:
+        _raise_http_from_rag(exc)
 
------------------------------------------------------------------------------
+
+-----------------------------------
 
 @router.post(
     "/extract-structure-chunk-and-ingest-v3",
@@ -104,156 +95,20 @@ async def extract_structure_chunk_and_ingest_v3(
         "force_on_metadata_change": force_on_metadata_change,
     })
 
-    return await ingest_records(ingest_payload, es=es)
+    try:
+        return await ingest_records(ingest_payload, es=es)
+    except RagError as exc:
+        _raise_http_from_rag(exc)
 
 
-----------------------------------------------------------------
+from app.src.elasticsearch_rag.es_client import close_es_client
 
-
-import os
-from fastapi import APIRouter, Depends
-from typing import Optional
-from pathlib import Path
-
-from app.common.logger import get_logger
-from app.src.chunking_pipeline import _run_extract_structure_chunking
-
-from app.src.elasticsearch_rag.es_client import get_es_client
-from app.src.elasticsearch_rag.ingestion import ingest_records
-from app.src.elasticsearch_rag.search import hybrid_search
-from app.src.elasticsearch_rag.models import (
-    IngestRequest,
-    IngestResponse,
-    SearchRequest,
-    SearchResponse,
-)
-
-
-logger = get_logger("regulation_synthesis_api")
-
-router = APIRouter(prefix="/synthesis", tags=["synthesis-generation"])
-
-
-AZURE_UAMI_OBJECT_ID = os.getenv("AZURE_UAMI_OBJECT_ID")
-ENVIRONMENT = os.getenv('ENVIRONMENT', 'nonprod')
-ADM_VERSION = os.getenv("ADM_VERSION", "Version Missing")
-
-DEFAULT_INPUTS = [
-    r"C:\Users\45493388\OneDrive - HSBC\Projects\adm\adm-calc-compliance-service\app\111"
-]
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-
-def _resolve_out_dir(out_dir: str) -> str:
-    candidate = Path(out_dir)
-    if candidate.is_absolute():
-        return str(candidate)
-    return str(PROJECT_ROOT / candidate)
-
-
-def _resolve_inputs(path: Optional[str]) -> list[str]:
-    if path and path.strip():
-        return [path.strip()]
-    return DEFAULT_INPUTS.copy()
-
-
-@router.get("/extract-structure-chunk-v3")
-def extract_and_structure_chunk_v3_get(
-    path: Optional[str] = None,
-    out_dir: str = "outputs_tables_only",
-    max_tokens: int = 450,
-    overlap_tokens: int = 80,
-    table_row_chunks: bool = False,
-    include_assets: bool = False,
-    inline_nodes: bool = True,
-):
-    """
-    New end-to-end: extract (in-memory) -> build LlamaIndex TextNodes -> return serialised nodes.
-    """
-    inputs = _resolve_inputs(path)
-    resolved_out_dir = _resolve_out_dir(out_dir)
-
-    return _run_extract_structure_chunking(
-        inputs=inputs,
-        out_dir=resolved_out_dir,
-        max_tokens=max_tokens,
-        overlap_tokens=overlap_tokens,
-        table_row_chunks=table_row_chunks,
-        include_assets=include_assets,
-        inline_nodes=inline_nodes,
-    )
-
-
-@router.post(
-    "/ingestion",
-    response_model=IngestResponse,
-    summary="Ingest pre-embedded records into Elasticsearch (with hash-based dedup).",
-)
-async def ingest(
-    payload: IngestRequest,
-    es=Depends(get_es_client),
-) -> IngestResponse:
-    logger.info(
-        "ingest_request_received",
-        extra={
-            "records": len(payload.records),
-            "force_on_metadata_change": payload.force_on_metadata_change,
-        },
-    )
-    return await ingest_records(payload, es=es)
-
-
-@router.post(
-    "/search",
-    response_model=SearchResponse,
-    summary="Hybrid BM25 + KNN search (caller provides query embedding).",
-)
-async def search(
-    payload: SearchRequest,
-    es=Depends(get_es_client),
-) -> SearchResponse:
-    logger.info(
-        "search_request_received",
-        extra={"top_k": payload.top_k, "filters": list(payload.filters.keys())},
-    )
-    return await hybrid_search(payload, es=es)
-
-
-@router.post(
-    "/extract-structure-chunk-and-ingest-v3",
-    response_model=IngestResponse,
-    summary="Extract → structure → chunk → ingest into Elasticsearch in one call.",
-)
-async def extract_structure_chunk_and_ingest_v3(
-    path: Optional[str] = None,
-    out_dir: str = "outputs_tables_only",
-    max_tokens: int = 450,
-    overlap_tokens: int = 80,
-    table_row_chunks: bool = False,
-    include_assets: bool = False,
-    inline_nodes: bool = True,
-    force_on_metadata_change: bool = False,
-    es=Depends(get_es_client),
-) -> IngestResponse:
-    inputs = _resolve_inputs(path)
-    resolved_out_dir = _resolve_out_dir(out_dir)
-
-    chunking_output = _run_extract_structure_chunking(
-        inputs=inputs,
-        out_dir=resolved_out_dir,
-        max_tokens=max_tokens,
-        overlap_tokens=overlap_tokens,
-        table_row_chunks=table_row_chunks,
-        include_assets=include_assets,
-        inline_nodes=inline_nodes,
-    )
-
-    ingest_payload = IngestRequest.model_validate({
-        **chunking_output,
-        "force_on_metadata_change": force_on_metadata_change,
-    })
-
-    return await ingest_records(ingest_payload, es=es)
-
-
-
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await start_stream_flusher()
+    await start_downstream_workers()
+    try:
+        yield
+    finally:
+        await stop_stream_flusher()
+        await close_es_client()
