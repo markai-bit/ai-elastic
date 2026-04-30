@@ -1,84 +1,259 @@
-failed_chunk_ids: set[str] = set()
+from fastapi import Depends
 
-if operations:
-    try:
-        resp = await es.bulk(operations=operations, refresh="wait_for")
-    except Exception as exc:  # noqa: BLE001
-        log.exception("bulk_ingest_failed", extra={"index": index, "ops": len(operations)})
-        raise IndexOperationError(f"Bulk ingest failed: {exc}") from exc
-
-    if resp.get("errors"):
-        # Walk every item and collect the ones that actually failed.
-        items = resp.get("items", [])
-        first_err = None
-        for item in items:
-            op = item.get("index") or item.get("create") or {}
-            if "error" in op:
-                failed_chunk_ids.add(op.get("_id"))
-                if first_err is None:
-                    first_err = op.get("error")
-
-        log.error(
-            "bulk_ingest_partial_failure",
-            extra={
-                "index": index,
-                "total_ops": len(operations) // 2,
-                "failed_count": len(failed_chunk_ids),
-                "first_error": first_err,
-            },
-        )
-
-        # If literally every write failed, this isn't partial — it's total.
-        # Raise so the caller gets a clear 502 instead of a misleading 200.
-        if len(failed_chunk_ids) == len(chunks_to_embed):
-            raise IndexOperationError(
-                f"All {len(failed_chunk_ids)} bulk writes failed. First error: {first_err}"
-            )
-
-
-
-
-
-
---------------------------------------------------
-
-
-outcomes: list[RecordOutcome] = []
-ingested = skipped = failed = 0
-for i, decision in enumerate(decisions):
-    if decision["action"] == "write":
-        chunk_id = chunk_ids.get(i)
-        if chunk_id in failed_chunk_ids:
-            outcomes.append(RecordOutcome(
-                record_index=i,
-                status="failed",
-                chunk_id=chunk_id,
-                content_hash=decision["hash"],
-                reason="Bulk write rejected by Elasticsearch",
-            ))
-            failed += 1
-        else:
-            outcomes.append(RecordOutcome(
-                record_index=i,
-                status=decision["status"],
-                chunk_id=chunk_id,
-                content_hash=decision["hash"],
-            ))
-            ingested += 1
-    else:
-        outcomes.append(RecordOutcome(
-            record_index=i,
-            status="skipped_duplicate",
-            content_hash=decision["hash"],
-            reason=decision.get("reason"),
-        ))
-        skipped += 1
-
-return IngestResponse(
-    index=index,
-    total=len(request.records),
-    ingested=ingested,
-    skipped=skipped,
-    failed=failed,    # was hardcoded 0 before
-    outcomes=outcomes,
+from app.src.elasticsearch_rag.es_client import get_es_client
+from app.src.elasticsearch_rag.ingestion import ingest_records
+from app.src.elasticsearch_rag.search import hybrid_search
+from app.src.elasticsearch_rag.models import (
+    IngestRequest,
+    IngestResponse,
+    SearchRequest,
+    SearchResponse,
 )
+
+----------------------------------------------
+import os
+from fastapi import APIRouter, Depends
+from typing import Optional
+from pathlib import Path
+
+from app.common.logger import get_logger
+from app.src.chunking_pipeline import _run_extract_structure_chunking
+
+from app.src.elasticsearch_rag.es_client import get_es_client
+from app.src.elasticsearch_rag.ingestion import ingest_records
+from app.src.elasticsearch_rag.search import hybrid_search
+from app.src.elasticsearch_rag.models import (
+    IngestRequest,
+    IngestResponse,
+    SearchRequest,
+    SearchResponse,
+)
+
+
+---------------------------------------------------
+
+@router.post(
+    "/ingestion",
+    response_model=IngestResponse,
+    summary="Ingest pre-embedded records into Elasticsearch (with hash-based dedup).",
+)
+async def ingest(
+    payload: IngestRequest,
+    es=Depends(get_es_client),
+) -> IngestResponse:
+    logger.info(
+        "ingest_request_received",
+        extra={
+            "records": len(payload.records),
+            "force_on_metadata_change": payload.force_on_metadata_change,
+        },
+    )
+    return await ingest_records(payload, es=es)
+
+
+
+------------------------------------------------------------------------
+@router.post(
+    "/search",
+    response_model=SearchResponse,
+    summary="Hybrid BM25 + KNN search (caller provides query embedding).",
+)
+async def search(
+    payload: SearchRequest,
+    es=Depends(get_es_client),
+) -> SearchResponse:
+    logger.info(
+        "search_request_received",
+        extra={"top_k": payload.top_k, "filters": list(payload.filters.keys())},
+    )
+    return await hybrid_search(payload, es=es)
+
+-----------------------------------------------------------------------------
+
+@router.post(
+    "/extract-structure-chunk-and-ingest-v3",
+    response_model=IngestResponse,
+    summary="Extract → structure → chunk → ingest into Elasticsearch in one call.",
+)
+async def extract_structure_chunk_and_ingest_v3(
+    path: Optional[str] = None,
+    out_dir: str = "outputs_tables_only",
+    max_tokens: int = 450,
+    overlap_tokens: int = 80,
+    table_row_chunks: bool = False,
+    include_assets: bool = False,
+    inline_nodes: bool = True,
+    force_on_metadata_change: bool = False,
+    es=Depends(get_es_client),
+) -> IngestResponse:
+    inputs = _resolve_inputs(path)
+    resolved_out_dir = _resolve_out_dir(out_dir)
+
+    chunking_output = _run_extract_structure_chunking(
+        inputs=inputs,
+        out_dir=resolved_out_dir,
+        max_tokens=max_tokens,
+        overlap_tokens=overlap_tokens,
+        table_row_chunks=table_row_chunks,
+        include_assets=include_assets,
+        inline_nodes=inline_nodes,
+    )
+
+    ingest_payload = IngestRequest.model_validate({
+        **chunking_output,
+        "force_on_metadata_change": force_on_metadata_change,
+    })
+
+    return await ingest_records(ingest_payload, es=es)
+
+
+----------------------------------------------------------------
+
+
+import os
+from fastapi import APIRouter, Depends
+from typing import Optional
+from pathlib import Path
+
+from app.common.logger import get_logger
+from app.src.chunking_pipeline import _run_extract_structure_chunking
+
+from app.src.elasticsearch_rag.es_client import get_es_client
+from app.src.elasticsearch_rag.ingestion import ingest_records
+from app.src.elasticsearch_rag.search import hybrid_search
+from app.src.elasticsearch_rag.models import (
+    IngestRequest,
+    IngestResponse,
+    SearchRequest,
+    SearchResponse,
+)
+
+
+logger = get_logger("regulation_synthesis_api")
+
+router = APIRouter(prefix="/synthesis", tags=["synthesis-generation"])
+
+
+AZURE_UAMI_OBJECT_ID = os.getenv("AZURE_UAMI_OBJECT_ID")
+ENVIRONMENT = os.getenv('ENVIRONMENT', 'nonprod')
+ADM_VERSION = os.getenv("ADM_VERSION", "Version Missing")
+
+DEFAULT_INPUTS = [
+    r"C:\Users\45493388\OneDrive - HSBC\Projects\adm\adm-calc-compliance-service\app\111"
+]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _resolve_out_dir(out_dir: str) -> str:
+    candidate = Path(out_dir)
+    if candidate.is_absolute():
+        return str(candidate)
+    return str(PROJECT_ROOT / candidate)
+
+
+def _resolve_inputs(path: Optional[str]) -> list[str]:
+    if path and path.strip():
+        return [path.strip()]
+    return DEFAULT_INPUTS.copy()
+
+
+@router.get("/extract-structure-chunk-v3")
+def extract_and_structure_chunk_v3_get(
+    path: Optional[str] = None,
+    out_dir: str = "outputs_tables_only",
+    max_tokens: int = 450,
+    overlap_tokens: int = 80,
+    table_row_chunks: bool = False,
+    include_assets: bool = False,
+    inline_nodes: bool = True,
+):
+    """
+    New end-to-end: extract (in-memory) -> build LlamaIndex TextNodes -> return serialised nodes.
+    """
+    inputs = _resolve_inputs(path)
+    resolved_out_dir = _resolve_out_dir(out_dir)
+
+    return _run_extract_structure_chunking(
+        inputs=inputs,
+        out_dir=resolved_out_dir,
+        max_tokens=max_tokens,
+        overlap_tokens=overlap_tokens,
+        table_row_chunks=table_row_chunks,
+        include_assets=include_assets,
+        inline_nodes=inline_nodes,
+    )
+
+
+@router.post(
+    "/ingestion",
+    response_model=IngestResponse,
+    summary="Ingest pre-embedded records into Elasticsearch (with hash-based dedup).",
+)
+async def ingest(
+    payload: IngestRequest,
+    es=Depends(get_es_client),
+) -> IngestResponse:
+    logger.info(
+        "ingest_request_received",
+        extra={
+            "records": len(payload.records),
+            "force_on_metadata_change": payload.force_on_metadata_change,
+        },
+    )
+    return await ingest_records(payload, es=es)
+
+
+@router.post(
+    "/search",
+    response_model=SearchResponse,
+    summary="Hybrid BM25 + KNN search (caller provides query embedding).",
+)
+async def search(
+    payload: SearchRequest,
+    es=Depends(get_es_client),
+) -> SearchResponse:
+    logger.info(
+        "search_request_received",
+        extra={"top_k": payload.top_k, "filters": list(payload.filters.keys())},
+    )
+    return await hybrid_search(payload, es=es)
+
+
+@router.post(
+    "/extract-structure-chunk-and-ingest-v3",
+    response_model=IngestResponse,
+    summary="Extract → structure → chunk → ingest into Elasticsearch in one call.",
+)
+async def extract_structure_chunk_and_ingest_v3(
+    path: Optional[str] = None,
+    out_dir: str = "outputs_tables_only",
+    max_tokens: int = 450,
+    overlap_tokens: int = 80,
+    table_row_chunks: bool = False,
+    include_assets: bool = False,
+    inline_nodes: bool = True,
+    force_on_metadata_change: bool = False,
+    es=Depends(get_es_client),
+) -> IngestResponse:
+    inputs = _resolve_inputs(path)
+    resolved_out_dir = _resolve_out_dir(out_dir)
+
+    chunking_output = _run_extract_structure_chunking(
+        inputs=inputs,
+        out_dir=resolved_out_dir,
+        max_tokens=max_tokens,
+        overlap_tokens=overlap_tokens,
+        table_row_chunks=table_row_chunks,
+        include_assets=include_assets,
+        inline_nodes=inline_nodes,
+    )
+
+    ingest_payload = IngestRequest.model_validate({
+        **chunking_output,
+        "force_on_metadata_change": force_on_metadata_change,
+    })
+
+    return await ingest_records(ingest_payload, es=es)
+
+
+
