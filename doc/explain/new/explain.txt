@@ -1,114 +1,52 @@
-def _raise_http_from_rag(exc: RagError) -> None:
-    """Convert a domain RagError into a FastAPI HTTPException with structured detail."""
-    logger.warning(
-        "rag_domain_error",
-        error_code=exc.error_code,
-        error_message=exc.message,
-        details=exc.details,
-    )
-    raise HTTPException(
-        status_code=exc.http_status,
-        detail={
-            "error_code": exc.error_code,
-            "message": exc.message,
-            "details": exc.details,
+def _core_properties(embed_dimension: int) -> dict[str, Any]:
+    """Reserved fields always present, regardless of metadata content."""
+    return {
+        "chunk_id":     {"type": "keyword"},
+        "content":      {"type": "text"},
+        "content_hash": {"type": "keyword"},
+        "embedding":    {
+            "type": "dense_vector",
+            "dims": embed_dimension,
+            "index": True,
+            "similarity": "cosine",
         },
-    ) from exc
-
----------------------------
-
-@router.post(
-    "/ingestion",
-    response_model=IngestResponse,
-    summary="Ingest pre-embedded records into Elasticsearch (with hash-based dedup).",
-)
-async def ingest(
-    payload: IngestRequest,
-    es=Depends(get_es_client),
-) -> IngestResponse:
-    logger.info(
-        "ingest_request_received",
-        records=len(payload.records),
-        force_on_metadata_change=payload.force_on_metadata_change,
-    )
-    try:
-        return await ingest_records(payload, es=es)
-    except RagError as exc:
-        _raise_http_from_rag(exc)
+        "ingested_at":  {"type": "date"},
+    }
 
 
--------------------------------------------
+--------------------------------------------------------------------------
 
-@router.post(
-    "/search",
-    response_model=SearchResponse,
-    summary="Hybrid BM25 + KNN search (caller provides query embedding).",
-)
-async def search(
-    payload: SearchRequest,
-    es=Depends(get_es_client),
-) -> SearchResponse:
-    logger.info(
-        "search_request_received",
-        top_k=payload.top_k,
-        filters=list(payload.filters.keys()),
-    )
-    try:
-        return await hybrid_search(payload, es=es)
-    except RagError as exc:
-        _raise_http_from_rag(exc)
+def build_hybrid_query(
+    *,
+    query_text: str,
+    query_vector: list[float],
+    top_k: int,
+    filters: dict[str, Any],
+    bm25_boost: float,
+    knn_boost: float,
+    knn_num_candidates: int,
+) -> dict[str, Any]:
+    filter_clauses = _filter_clauses(filters)
 
+    bm25_query: dict[str, Any] = {
+        "bool": {
+            "must":   [{"match": {"content": {"query": query_text, "boost": bm25_boost}}}],
+            "filter": filter_clauses,
+        }
+    }
 
------------------------------------
+    knn_query: dict[str, Any] = {
+        "field": "embedding",
+        "query_vector": query_vector,
+        "k": top_k,
+        "num_candidates": max(knn_num_candidates, top_k * 10),
+        "boost": knn_boost,
+    }
+    if filter_clauses:
+        knn_query["filter"] = filter_clauses
 
-@router.post(
-    "/extract-structure-chunk-and-ingest-v3",
-    response_model=IngestResponse,
-    summary="Extract → structure → chunk → ingest into Elasticsearch in one call.",
-)
-async def extract_structure_chunk_and_ingest_v3(
-    path: Optional[str] = None,
-    out_dir: str = "outputs_tables_only",
-    max_tokens: int = 450,
-    overlap_tokens: int = 80,
-    table_row_chunks: bool = False,
-    include_assets: bool = False,
-    inline_nodes: bool = True,
-    force_on_metadata_change: bool = False,
-    es=Depends(get_es_client),
-) -> IngestResponse:
-    inputs = _resolve_inputs(path)
-    resolved_out_dir = _resolve_out_dir(out_dir)
-
-    chunking_output = _run_extract_structure_chunking(
-        inputs=inputs,
-        out_dir=resolved_out_dir,
-        max_tokens=max_tokens,
-        overlap_tokens=overlap_tokens,
-        table_row_chunks=table_row_chunks,
-        include_assets=include_assets,
-        inline_nodes=inline_nodes,
-    )
-
-    ingest_payload = IngestRequest.model_validate({
-        **chunking_output,
-        "force_on_metadata_change": force_on_metadata_change,
-    })
-
-    try:
-        return await ingest_records(ingest_payload, es=es)
-    except RagError as exc:
-        _raise_http_from_rag(exc)
+    return {"size": top_k, "query": bm25_query, "knn": knn_query}
 
 
-from app.src.elasticsearch_rag.es_client import close_es_client
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    await start_stream_flusher()
-    await start_downstream_workers()
-    try:
-        yield
-    finally:
-        await stop_stream_flusher()
-        await close_es_client()
+
